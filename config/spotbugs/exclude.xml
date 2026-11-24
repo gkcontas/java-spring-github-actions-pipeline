@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+    <!--
+        EI_EXPOSE_REP / EI_EXPOSE_REP2 fire on every constructor-injected Spring bean
+        and every Lombok getter of a JPA entity. Excluded by pattern, not with blanket
+        annotations, so every other detector keeps running on the same classes.
+    -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+</FindBugsFilter>
