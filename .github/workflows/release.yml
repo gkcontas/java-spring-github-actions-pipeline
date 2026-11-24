@@ -1,0 +1,95 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # create the GitHub release
+      packages: write   # add version tags to the existing image
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # On a tag the cache is read-only: it reuses what main wrote and adds nothing.
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+
+      # build.gradle.kts is the single source of truth for the version. A tag that
+      # disagrees with it is a mistake, not a new version.
+      - name: Tag must match the project version
+        id: version
+        run: |
+          version=$(./gradlew -q properties --property version | awk '/^version:/ {print $2}')
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match project version ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build once, promote: the image released is the one CI built, tested and pushed
+      # for this commit, byte for byte (same digest). If it does not exist, the commit
+      # never passed CI on main and is not released.
+      - name: Promote the image built by CI
+        run: |
+          source="${IMAGE}:sha-${GITHUB_SHA}"
+          if ! docker buildx imagetools inspect "$source" >/dev/null 2>&1; then
+            echo "::error::no image ${source}: tag a commit that passed CI on main"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${{ steps.version.outputs.version }}" \
+            --tag "${IMAGE}:${{ steps.version.outputs.minor }}" \
+            --tag "${IMAGE}:latest" \
+            "$source"
+          {
+            echo '### Image'
+            echo '```'
+            docker buildx imagetools inspect "${IMAGE}:${{ steps.version.outputs.version }}" | head -3
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The jar is rebuilt rather than fetched from the CI run (artifacts expire).
+      # The build is reproducible, so its checksum matches the jar CI tested.
+      - name: Build jar
+        run: ./gradlew bootJar
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd build/libs
+          jar=$(ls *.jar)
+          sha256sum "$jar" > "${jar}.sha256"
+          cat "${jar}.sha256" >> "$GITHUB_STEP_SUMMARY"
+          gh release create "$GITHUB_REF_NAME" "$jar" "${jar}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "$GITHUB_REF_NAME"
