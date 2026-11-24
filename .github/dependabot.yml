@@ -1,0 +1,19 @@
+# Pinning actions by SHA only works if someone bumps the SHAs: Dependabot does it and
+# keeps the "# vX.Y.Z" comment in sync. One grouped PR per ecosystem per week.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      gradle:
+        patterns: ["*"]
