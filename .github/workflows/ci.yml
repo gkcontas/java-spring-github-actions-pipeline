@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  pull_request:
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+# A newer push to the same PR makes the running build pointless, so it is cancelled.
+# On main every commit runs to the end: cancelling there could leave a commit without
+# its image, and the release job promotes exactly that image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default; the one job that publishes asks for more.
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Actions are pinned to a commit SHA: a tag can be moved to malicious code after
+      # the fact (tj-actions/changed-files, March 2025); a SHA cannot.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Caches the Gradle user home (dependencies, wrapper, build cache). Only the
+      # default branch writes; PRs and tags read. Also validates the wrapper jar.
+      # "basic" is the open-source provider on top of the GitHub Actions cache; the
+      # default ("enhanced") is a commercial service with its own terms.
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+
+      # Compile, Checkstyle, SpotBugs, unit and Testcontainers tests, coverage gate:
+      # all of it is wired into "check", so this is the same command a developer runs.
+      - name: Build
+        run: ./gradlew build
+
+      - name: Coverage summary
+        if: ${{ !cancelled() && hashFiles('build/reports/jacoco/test/jacocoTestReport.csv') != '' }}
+        run: python3 .github/scripts/coverage-summary.py build/reports/jacoco/test/jacocoTestReport.csv >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Jar checksum
+        run: |
+          {
+            echo '### Jar'
+            echo '```'
+            (cd build/libs && sha256sum *.jar)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-reports
+          path: |
+            build/reports/
+            build/test-results/
+          retention-days: 7
+
+      - name: Upload jar
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: app-jar
+          path: build/libs
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=pr
+
+      # Build once into the local daemon, test that exact image, and only then push.
+      # Layers come from the GitHub Actions cache, so an unchanged dependency layer is
+      # neither rebuilt nor re-uploaded.
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: feature-flags:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: .github/scripts/smoke-test.sh feature-flags:smoke | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Pull requests (forks in particular) build and test the image but never publish.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
